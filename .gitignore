@@ -1,0 +1,13 @@
+# Slide data (may contain patient information) and outputs
+*.dcm
+*.dcm.import
+*.svs
+*.svs.partial
+*.zip
+svs_output/
+dicom2svs_summary_*.csv
+
+# Python / OS
+__pycache__/
+.venv/
+.DS_Store
