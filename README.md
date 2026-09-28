@@ -184,3 +184,7 @@ confirm.
 | `Full resolution: ImageType DERIVED/…/RESAMPLED` | The folder has only lower-resolution levels. The full-resolution file is missing from the export. |
 | `… already exists (use --overwrite …)` | Delete the old `.svs` or rerun with `--overwrite`. |
 | Slow on a network drive | Copy the DICOM folder to a local disk first. The tool reads the full-resolution file twice. |
+
+## License
+
+[MIT](LICENSE) © 2026 Jianan Chen
