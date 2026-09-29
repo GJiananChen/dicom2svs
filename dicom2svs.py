@@ -38,6 +38,7 @@ import math
 import os
 import struct
 import sys
+import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -365,22 +366,40 @@ def check_source(slide: Slide) -> tuple[CheckResult, SourceInfo]:
 # --------------------------------------------------------------------------- #
 
 class TileSource:
-    """Random access to the encapsulated JPEG frames of a DICOM file."""
+    """Random access to the encapsulated JPEG frames of a DICOM file.
+
+    Each thread gets its own file handle so seek+read pairs never interleave. This is
+    portable (os.pread does not exist on Windows) and works on network drives.
+    """
 
     def __init__(self, info: SourceInfo):
         self.info = info
-        self.fd = os.open(info.path, os.O_RDONLY)
+        self._local = threading.local()
+        self._handles: list = []
+        self._lock = threading.Lock()
         self.index = self._build_index()
         self.cols = math.ceil(info.width / info.tile_w)
         self.rows = math.ceil(info.height / info.tile_h)
 
+    def _read(self, offset: int, length: int) -> bytes:
+        fh = getattr(self._local, "fh", None)
+        if fh is None:
+            fh = self._local.fh = open(self.info.path, "rb")
+            with self._lock:
+                self._handles.append(fh)
+        fh.seek(offset)
+        data = fh.read(length)
+        if len(data) != length:
+            raise ValueError(f"unexpected end of file at byte {offset:,}")
+        return data
+
     def _build_index(self) -> list[tuple[int, int]]:
         pos = self.info.pixel_data_offset + 12
         index = []
-        end = os.fstat(self.fd).st_size
+        end = self.info.path.stat().st_size
         first = True
         while pos + 8 <= end:
-            group, elem, length = struct.unpack("<HHI", os.pread(self.fd, 8, pos))
+            group, elem, length = struct.unpack("<HHI", self._read(pos, 8))
             pos += 8
             if (group, elem) == (0xFFFE, 0xE0DD):  # sequence delimiter
                 break
@@ -397,10 +416,13 @@ class TileSource:
 
     def tile(self, row: int, col: int) -> bytes:
         offset, length = self.index[row * self.cols + col]
-        return os.pread(self.fd, length, offset)
+        return self._read(offset, length)
 
     def close(self) -> None:
-        os.close(self.fd)
+        with self._lock:
+            for fh in self._handles:
+                fh.close()
+            self._handles.clear()
 
 
 @dataclass
@@ -678,7 +700,8 @@ def print_summary(outcomes: list[Outcome], target: Path, elapsed: float) -> Path
     if not target.exists():
         return None
     report = target / f"dicom2svs_summary_{datetime.now():%Y%m%d_%H%M%S}.csv"
-    with open(report, "w", newline="") as fh:
+    # utf-8-sig so Excel (notably on Windows) shows µ and non-English folder names correctly
+    with open(report, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
         w.writerow(["slide", "status", "needs_review", "warning_count", "warnings", "errors",
                     "source_folder", "source_file", "dicom_files_in_folder", "output_file",
@@ -707,6 +730,10 @@ def print_summary(outcomes: list[Outcome], target: Path, elapsed: float) -> Path
 # --------------------------------------------------------------------------- #
 
 def main() -> int:
+    # Windows consoles may use a legacy code page; never crash on a folder name or "µ".
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(
         description="Convert the largest DICOM whole-slide image in each folder to a "
                     "pyramidal Aperio .svs file. Missing or unexpected metadata (e.g. no "

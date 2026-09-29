@@ -12,5 +12,6 @@ files. Dependencies are declared inline (PEP 723), so always run it with
   `convert`) → OpenSlide verification (`verify`) → summary table and CSV (`print_summary`).
 - The 40x level must stay a byte-for-byte copy of the DICOM JPEG tiles. Only the
   lower levels are re-encoded.
-- Quick check after editing: `uv run dicom2svs.py --help`, then `--dry-run` on a sample
-  folder. No sample data is included in the repo, because slide data may be patient data.
+- Must run on Windows, Linux and macOS: no POSIX-only calls (e.g. `os.pread`), open
+  files in binary mode, write text as UTF-8.
+- After editing, run `uv run tests/run_tests.py` (synthetic slides, no patient data). Never commit real slide data.

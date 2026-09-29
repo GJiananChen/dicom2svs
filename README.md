@@ -91,6 +91,9 @@ Pillow, numpy, tqdm and OpenSlide. `openslide-bin` ships the OpenSlide library i
 you don't need Homebrew or apt packages. Python 3.10 or newer is needed; uv downloads one
 if necessary.
 
+**Works on Windows, Linux and macOS.** To check it on your machine without real data,
+run `uv run tests/run_tests.py` (see [Development](#development)).
+
 ## Usage
 
 ```bash
@@ -99,6 +102,12 @@ uv run dicom2svs.py /path/to/dicom_folder_1 /path/to/dicom_folder_2 -o /path/to/
 
 # Convert
 uv run dicom2svs.py /path/to/dicom_folder_1 /path/to/dicom_folder_2 -o /path/to/svs_out
+```
+
+On Windows (PowerShell or Command Prompt), quote paths that contain spaces:
+
+```powershell
+uv run dicom2svs.py "D:\Slides\batch 1" "\\server\share\batch2" -o "D:\Slides\svs_out"
 ```
 
 | Option | Default | Meaning |
@@ -243,6 +252,19 @@ after you confirm.
 | `[WARN] Magnification: .svs has no magnification or MPP` | Neither was recorded. Set the pixel size in your viewer before measuring. |
 | `… already exists (use --overwrite …)` | Delete the old `.svs` or rerun with `--overwrite`. |
 | Slow on a network drive | Copy the DICOM folder to a local disk first. The tool reads the full-resolution file twice. |
+
+## Development
+
+`tests/run_tests.py` builds three small synthetic slides (no patient data), converts them
+and checks the results: a clean 40x slide, one with missing metadata, and one with an
+unsupported codec. Run it before pushing changes:
+
+```bash
+uv run tests/run_tests.py
+```
+
+`tests/make_test_slides.py OUT_DIR` writes the same synthetic slides if you want to try
+the tool without real data.
 
 ## License
 
