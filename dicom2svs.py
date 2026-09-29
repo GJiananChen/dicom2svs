@@ -16,16 +16,17 @@
 dicom2svs — find the full-resolution DICOM whole-slide image in one or more
 directory trees and convert it to an Aperio-style pyramidal .svs file.
 
-For every slide found (DICOM files grouped by folder and SeriesInstanceUID) the tool:
-  1. picks the largest DICOM file of the slide,
-  2. checks that it is a 40x, full-resolution (ORIGINAL/VOLUME) image,
+For every folder containing DICOM files the tool:
+  1. picks the largest DICOM file in the folder (one .svs per folder),
+  2. checks that it is a 40x, full-resolution (ORIGINAL/VOLUME) image; missing or
+     unexpected metadata is recorded as a warning for review, not a reason to skip,
   3. copies its JPEG tiles into the .svs unchanged (no re-compression),
   4. builds the lower-resolution pyramid levels and a thumbnail from it,
-  5. re-opens the result with OpenSlide to confirm it reads as a 40x slide
-     with the same dimensions and pixels as the source.
+  5. re-opens the result with OpenSlide to confirm it has the same dimensions,
+     magnification, MPP and pixels as the source.
 
 Usage:
-  uv run dicom2svs.py DIR [DIR ...] -o TARGET_DIR [--dry-run] [--overwrite]
+  uv run dicom2svs.py DIR [DIR ...] -o TARGET_DIR [--dry-run] [--overwrite] [--strict]
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ import os
 import struct
 import sys
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -48,6 +50,10 @@ import pydicom
 import tifffile
 from PIL import Image
 from tqdm import tqdm
+
+# Badly entered values are reported by our own checks, so pydicom's warnings are noise.
+pydicom.config.settings.reading_validation_mode = pydicom.config.IGNORE
+warnings.filterwarnings("ignore", module="pydicom")
 
 WSI_SOP_CLASS = "1.2.840.10008.5.1.4.1.1.77.1.6"  # VL Whole Slide Microscopy Image Storage
 JPEG_BASELINE = "1.2.840.10008.1.2.4.50"
@@ -69,7 +75,6 @@ WHITE = (255, 255, 255)
 class DicomFile:
     path: Path
     size: int
-    series_uid: str
     image_type: tuple[str, ...]
     width: int
     height: int
@@ -77,7 +82,8 @@ class DicomFile:
 
 @dataclass
 class Slide:
-    series_uid: str
+    """All DICOM files of one folder; only the largest one is converted."""
+    folder: Path
     files: list[DicomFile]
     name: str = ""
     largest: DicomFile | None = None
@@ -93,36 +99,33 @@ def is_dicom(path: Path) -> bool:
 
 
 def scan(dirs: list[Path]) -> list[Slide]:
-    """Find every DICOM file under `dirs` and group them into slides by folder and series."""
+    """Find every DICOM file under `dirs`; each folder containing DICOM files is one slide."""
     candidates = []
     for d in dirs:
         for root, subdirs, names in os.walk(d):
             subdirs[:] = sorted(s for s in subdirs if not s.startswith("."))
             candidates += [Path(root) / n for n in sorted(names) if not n.startswith(".")]
 
-    slides: dict[tuple[Path, str], Slide] = {}
+    candidates = list(dict.fromkeys(candidates))  # a folder may sit under two given dirs
+
+    slides: dict[Path, Slide] = {}
     for path in tqdm(candidates, desc="Scanning", unit="file", leave=False):
         if not is_dicom(path):
             continue
         try:
             ds = pydicom.dcmread(
                 path, stop_before_pixels=True,
-                specific_tags=["SeriesInstanceUID", "ImageType",
-                               "TotalPixelMatrixColumns", "TotalPixelMatrixRows",
+                specific_tags=["ImageType", "TotalPixelMatrixColumns", "TotalPixelMatrixRows",
                                "Columns", "Rows"],
             )
+            image_type = tuple(str(t) for t in ds.get("ImageType", ()) or ())
+            width = int(ds.get("TotalPixelMatrixColumns", ds.get("Columns", 0)) or 0)
+            height = int(ds.get("TotalPixelMatrixRows", ds.get("Rows", 0)) or 0)
         except Exception:
-            continue
-        uid = str(ds.get("SeriesInstanceUID", "") or f"no-series:{path.parent}")
-        f = DicomFile(
-            path=path,
-            size=path.stat().st_size,
-            series_uid=uid,
-            image_type=tuple(ds.get("ImageType", ())),
-            width=int(ds.get("TotalPixelMatrixColumns", ds.get("Columns", 0)) or 0),
-            height=int(ds.get("TotalPixelMatrixRows", ds.get("Rows", 0)) or 0),
-        )
-        slides.setdefault((path.parent, uid), Slide(series_uid=uid, files=[])).files.append(f)
+            # Badly formed headers still count; the pre-checks report what is wrong.
+            image_type, width, height = (), 0, 0
+        f = DicomFile(path, path.stat().st_size, image_type, width, height)
+        slides.setdefault(path.parent, Slide(folder=path.parent, files=[])).files.append(f)
 
     result = list(slides.values())
     for s in result:
@@ -132,20 +135,20 @@ def scan(dirs: list[Path]) -> list[Slide]:
 
 
 def assign_names(slides: list[Slide]) -> None:
-    """Name each slide after its folder; disambiguate folders holding several slides."""
-    by_dir: dict[Path, list[Slide]] = {}
+    """Name each slide after its folder, adding the parent folder when names collide."""
+    counts: dict[str, int] = {}
     for s in slides:
-        by_dir.setdefault(s.largest.path.parent, []).append(s)
+        counts[s.folder.name] = counts.get(s.folder.name, 0) + 1
     used: set[str] = set()
-    for folder, group in by_dir.items():
-        for s in group:
-            name = folder.name
-            if len(group) > 1 or name in used:
-                name = f"{name}_{s.largest.path.stem}"
-            while name in used:
-                name += "_x"
-            used.add(name)
-            s.name = name
+    for s in slides:
+        name = s.folder.name
+        if counts[name] > 1:
+            name = f"{s.folder.parent.name}_{name}"
+        base, n = name, 2
+        while name in used:
+            name, n = f"{base}_{n}", n + 1
+        used.add(name)
+        s.name = name
 
 
 # --------------------------------------------------------------------------- #
@@ -162,6 +165,8 @@ class SourceInfo:
     frames: int = 0
     mpp: float = 0.0
     objective: float | None = None
+    app_mag: float | None = None  # magnification written to the .svs
+    mag_source: str = "unknown"   # metadata | inferred from MPP | unknown
     manufacturer: str = ""
     model: str = ""
     icc: bytes | None = None
@@ -172,11 +177,14 @@ class SourceInfo:
 
 @dataclass
 class CheckResult:
+    """`failed` stops the conversion; `warnings` are recorded for review only."""
     passed: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
-    def check(self, ok: bool, label: str, detail: str) -> bool:
-        (self.passed if ok else self.failed).append(f"{label}: {detail}")
+    def check(self, ok: bool, label: str, detail: str, fatal: bool = True) -> bool:
+        target = self.passed if ok else self.failed if fatal else self.warnings
+        target.append(f"{label}: {detail}")
         return ok
 
     @property
@@ -231,8 +239,29 @@ def first_frame(path: Path, offset: int) -> bytes:
         return next(pydicom.encaps.generate_frames(f, number_of_frames=1))
 
 
+def safe(get, default=None):
+    """Read one metadata value; badly entered or missing values give `default`."""
+    try:
+        value = get()
+        return default if value is None or value == "" else value
+    except Exception:
+        return default
+
+
+def infer_magnification(mpp: float) -> float | None:
+    """Nearest standard objective for a pixel size (40x ~ 0.25 µm/px, 20x ~ 0.5 µm/px)."""
+    if not mpp:
+        return None
+    return min((5, 10, 20, 40, 60, 80), key=lambda m: abs(math.log((10 / mpp) / m)))
+
+
 def check_source(slide: Slide) -> tuple[CheckResult, SourceInfo]:
-    """Confirm the largest file of the slide is a 40x full-resolution WSI we can convert."""
+    """Check the largest file of the folder.
+
+    Metadata problems (missing or unexpected magnification, pixel size, image type, …)
+    are warnings: the file is still converted and the warning goes to the summary for
+    review. Only problems that make conversion impossible are failures.
+    """
     f = slide.largest
     res = CheckResult()
     info = SourceInfo(path=f.path)
@@ -242,75 +271,92 @@ def check_source(slide: Slide) -> tuple[CheckResult, SourceInfo]:
         res.check(False, "Readable", f"cannot read DICOM header ({e})")
         return res, info
 
-    res.check(ds.get("SOPClassUID") == WSI_SOP_CLASS, "Whole-slide image",
-              "VL Whole Slide Microscopy" if ds.get("SOPClassUID") == WSI_SOP_CLASS
-              else f"SOP class is {getattr(ds.get('SOPClassUID'), 'name', 'unknown')}")
+    sop = safe(lambda: ds.SOPClassUID)
+    res.check(sop == WSI_SOP_CLASS, "Whole-slide image",
+              "VL Whole Slide Microscopy" if sop == WSI_SOP_CLASS
+              else f"SOP class is {getattr(sop, 'name', sop) or 'missing'}", fatal=False)
 
-    image_type = [str(t).upper() for t in ds.get("ImageType", [])]
+    image_type = [str(t).upper() for t in safe(lambda: list(ds.ImageType), [])]
     full_res = (len(image_type) >= 3 and image_type[0] == "ORIGINAL" and image_type[2] == "VOLUME"
                 and (len(image_type) < 4 or image_type[3] == "NONE"))
     res.check(full_res, "Full resolution",
               f"ImageType {'/'.join(image_type) or 'missing'}"
-              + ("" if full_res else " (expected ORIGINAL/.../VOLUME/NONE)"))
+              + ("" if full_res else " (expected ORIGINAL/.../VOLUME/NONE)"), fatal=False)
 
-    info.width = int(ds.get("TotalPixelMatrixColumns", 0) or 0)
-    info.height = int(ds.get("TotalPixelMatrixRows", 0) or 0)
-    siblings = [s for s in slide.files if s is not f and "VOLUME" in s.image_type]
-    bigger = [s for s in siblings if s.width * s.height > info.width * info.height]
+    info.width = int(safe(lambda: ds.TotalPixelMatrixColumns, 0))
+    info.height = int(safe(lambda: ds.TotalPixelMatrixRows, 0))
+    others = [s for s in slide.files if s is not f]
+    bigger = [s for s in others if s.width * s.height > info.width * info.height]
     res.check(not bigger, "Largest level",
-              f"{info.width:,} x {info.height:,} px is the largest of {len(siblings) + 1} "
-              f"pyramid file(s)" if not bigger else f"{bigger[0].path.name} has more pixels")
+              f"{info.width:,} x {info.height:,} px is the largest of {len(others) + 1} "
+              f"DICOM file(s) in the folder" if not bigger
+              else f"{bigger[0].path.name} has more pixels ({bigger[0].width:,} x "
+                   f"{bigger[0].height:,}) but a smaller file size", fatal=False)
 
-    try:
-        info.objective = float(ds.OpticalPathSequence[0].ObjectiveLensPower)
-    except Exception:
-        info.objective = None
+    info.objective = safe(lambda: float(ds.OpticalPathSequence[0].ObjectiveLensPower))
     res.check(info.objective == EXPECTED_OBJECTIVE, "Objective 40x",
               f"objective lens power {info.objective:g}x" if info.objective is not None
-              else "objective lens power not recorded")
+              else "objective lens power not recorded", fatal=False)
 
-    try:
-        spacing = ds.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing
-        info.mpp = float(spacing[1]) * 1000  # mm -> µm; PixelSpacing is (row, column)
-        mpp_y = float(spacing[0]) * 1000
-    except Exception:
-        info.mpp = mpp_y = 0.0
+    spacing = safe(lambda: [float(v) * 1000 for v in  # mm -> µm; (row, column) order
+                            ds.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0].PixelSpacing])
+    if spacing is None:
+        spacing = safe(lambda: [float(v) * 1000 for v in ds.PixelSpacing])
+    mpp_y, info.mpp = (spacing if spacing and len(spacing) == 2 and min(spacing) > 0 else (0.0, 0.0))
     lo, hi = MPP_RANGE_40X
     res.check(lo <= info.mpp <= hi and abs(info.mpp - mpp_y) < 1e-3, "40x pixel size",
-              f"{info.mpp:.4f} µm/px (40x range {lo}-{hi})" if info.mpp
-              else "pixel spacing not recorded")
+              f"{info.mpp:.4f} µm/px (40x range {lo}-{hi})"
+              + (f", but {mpp_y:.4f} µm/px vertically" if info.mpp and abs(info.mpp - mpp_y) >= 1e-3 else "")
+              if info.mpp else "pixel spacing not recorded", fatal=False)
 
-    syntax = ds.file_meta.get("TransferSyntaxUID")
-    info.tile_w, info.tile_h = int(ds.get("Columns", 0)), int(ds.get("Rows", 0))
-    info.frames = int(ds.get("NumberOfFrames", 1))
+    # Magnification written to the .svs: the recorded objective, else inferred from MPP.
+    if info.objective is not None:
+        info.app_mag, info.mag_source = info.objective, "metadata"
+    elif info.mpp:
+        info.app_mag, info.mag_source = infer_magnification(info.mpp), "inferred from MPP"
+        res.warnings.append(f"Magnification: .svs labelled {info.app_mag:g}x, inferred from "
+                            f"{info.mpp:.4f} µm/px")
+    else:
+        res.warnings.append("Magnification: .svs has no magnification or MPP; "
+                            "set them in the viewer before measuring")
+    if info.objective is not None and info.mpp:
+        expected = infer_magnification(info.mpp)
+        if expected != info.objective:
+            res.warnings.append(f"Magnification: objective says {info.objective:g}x but "
+                                f"{info.mpp:.4f} µm/px looks like {expected:g}x")
+
+    # Everything below is needed to copy the tiles, so problems here stop the conversion.
+    syntax = safe(lambda: ds.file_meta.TransferSyntaxUID)
+    info.tile_w, info.tile_h = int(safe(lambda: ds.Columns, 0)), int(safe(lambda: ds.Rows, 0))
+    info.frames = int(safe(lambda: ds.NumberOfFrames, 1))
+    res.check(info.width > 0 and info.height > 0, "Image size",
+              f"{info.width:,} x {info.height:,} px" if info.width and info.height
+              else "TotalPixelMatrixColumns/Rows missing, so the tiles cannot be placed")
     expected_frames = (math.ceil(info.width / max(info.tile_w, 1))
                        * math.ceil(info.height / max(info.tile_h, 1)))
     layout_ok = (
         syntax == JPEG_BASELINE
-        and ds.get("DimensionOrganizationType", "TILED_FULL") == "TILED_FULL"
-        and int(ds.get("TotalPixelMatrixFocalPlanes", 1)) == 1
-        and int(ds.get("NumberOfOpticalPaths", 1)) == 1
-        and int(ds.get("SamplesPerPixel", 0)) == 3
-        and int(ds.get("BitsAllocated", 0)) == 8
-        and info.frames == expected_frames
+        and safe(lambda: ds.DimensionOrganizationType, "TILED_FULL") == "TILED_FULL"
+        and int(safe(lambda: ds.TotalPixelMatrixFocalPlanes, 1)) == 1
+        and int(safe(lambda: ds.NumberOfOpticalPaths, 1)) == 1
+        and int(safe(lambda: ds.SamplesPerPixel, 0)) == 3
+        and int(safe(lambda: ds.BitsAllocated, 0)) == 8
+        and info.frames == expected_frames > 0
     )
     if layout_ok:
-        info.jpeg_colorspace, info.subsampling = jpeg_colour_info(
-            first_frame(f.path, info.pixel_data_offset))
+        info.jpeg_colorspace, info.subsampling = safe(
+            lambda: jpeg_colour_info(first_frame(f.path, info.pixel_data_offset)), ("unknown", None))
         layout_ok = info.jpeg_colorspace != "unknown"
     res.check(layout_ok, "Tile encoding",
               f"{info.frames:,} JPEG tiles of {info.tile_w}x{info.tile_h}, single focal plane"
               if layout_ok else
               f"unsupported: {getattr(syntax, 'name', syntax)}, "
-              f"{ds.get('DimensionOrganizationType', '?')}, {info.frames} frames "
+              f"{safe(lambda: ds.DimensionOrganizationType, '?')}, {info.frames} frames "
               f"(this tool copies TILED_FULL JPEG-baseline tiles)")
 
-    info.manufacturer = str(ds.get("Manufacturer", ""))
-    info.model = str(ds.get("ManufacturerModelName", ""))
-    try:
-        info.icc = bytes(ds.OpticalPathSequence[0].ICCProfile)
-    except Exception:
-        info.icc = None
+    info.manufacturer = str(safe(lambda: ds.Manufacturer, ""))
+    info.model = str(safe(lambda: ds.ManufacturerModelName, ""))
+    info.icc = safe(lambda: bytes(ds.OpticalPathSequence[0].ICCProfile))
     return res, info
 
 
@@ -424,8 +470,8 @@ def aperio_description(info: SourceInfo, name: str, quality: int, level: Level |
         return f"{head} -> {level.width}x{level.height} JPEG/RGB Q={quality}"
     fields = [
         f"{head} JPEG/RGB Q={quality}",
-        f"AppMag = {info.objective:g}",
-        f"MPP = {info.mpp:.6f}",
+        *([f"AppMag = {info.app_mag:g}"] if info.app_mag else []),
+        *([f"MPP = {info.mpp:.6f}"] if info.mpp else []),
         f"Filename = {name}",
         f"Source = DICOM {info.path.name}",
         f"Scanner = {info.manufacturer} {info.model}".strip(),
@@ -514,10 +560,13 @@ def verify(out_path: Path, info: SourceInfo) -> CheckResult:
                   f"OpenSlide vendor '{p.get('openslide.vendor')}'")
         res.check(slide.dimensions == (info.width, info.height), "Full resolution kept",
                   f"{slide.dimensions[0]:,} x {slide.dimensions[1]:,} px")
-        res.check(p.get("openslide.objective-power") == f"{info.objective:g}" == "40",
-                  "Reads as 40x", f"objective power {p.get('openslide.objective-power')}")
-        mpp = float(p.get("openslide.mpp-x", 0))
-        res.check(abs(mpp - info.mpp) < 1e-4, "MPP kept", f"{mpp:.4f} µm/px")
+        power = p.get("openslide.objective-power")
+        if info.app_mag:
+            res.check(power == f"{info.app_mag:g}", "Magnification kept",
+                      f"objective power {power} ({info.mag_source})")
+        mpp = float(p.get("openslide.mpp-x", 0) or 0)
+        if info.mpp:
+            res.check(abs(mpp - info.mpp) < 1e-4, "MPP kept", f"{mpp:.4f} µm/px")
 
         # Pixel check: the centre tile must decode identically to the DICOM frame.
         src = TileSource(info)
@@ -551,7 +600,12 @@ class Outcome:
     info: SourceInfo | None = None
     output: Path | None = None
     seconds: float = 0.0
-    notes: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)     # errors and reasons for skipping
+    warnings: list[str] = field(default_factory=list)  # metadata issues to review
+
+
+def needs_review(o: Outcome) -> bool:
+    return bool(o.warnings) or o.status in ("skipped", "failed")
 
 
 def human(n: float) -> str:
@@ -566,6 +620,8 @@ def print_checks(title: str, res: CheckResult) -> None:
     tqdm.write(f"  {title}")
     for line in res.passed:
         tqdm.write(f"    [ok]   {line}")
+    for line in res.warnings:
+        tqdm.write(f"    [WARN] {line}")
     for line in res.failed:
         tqdm.write(f"    [FAIL] {line}")
 
@@ -584,13 +640,14 @@ def print_summary(outcomes: list[Outcome], target: Path, elapsed: float) -> Path
             o.slide.name,
             o.status,
             f"{i.width:,}x{i.height:,}" if i and i.width else "-",
-            f"{i.objective:g}x" if i and i.objective else "-",
+            (f"{i.app_mag:g}x" + ("*" if i.mag_source != "metadata" else "")) if i and i.app_mag else "-",
             f"{i.mpp:.4f}" if i and i.mpp else "-",
             human(o.slide.largest.size),
             human(o.output.stat().st_size) if o.output and o.output.exists() else "-",
             f"{o.seconds:.0f}s" if o.seconds else "-",
+            f"{len(o.warnings)} warning(s)" if o.warnings else "-",
         ])
-    header = ["Slide", "Status", "Pixels", "Mag", "MPP", "DICOM", "SVS", "Time"]
+    header = ["Slide", "Status", "Pixels", "Mag", "MPP", "DICOM", "SVS", "Time", "Review"]
     widths = [max(len(str(r[k])) for r in rows + [header]) for k in range(len(header))]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     print(fmt.format(*header))
@@ -598,35 +655,49 @@ def print_summary(outcomes: list[Outcome], target: Path, elapsed: float) -> Path
     for r in rows:
         print(fmt.format(*r))
 
-    problems = [o for o in outcomes if o.notes]
+    if any(i and i.app_mag and i.mag_source != "metadata" for i in (o.info for o in outcomes)):
+        print("* magnification inferred from pixel size (objective not recorded)")
+
+    problems = [o for o in outcomes if o.notes or o.warnings]
     if problems:
         print("\nDetails:")
         for o in problems:
             for n in o.notes:
                 print(f"  {o.slide.name}: {n}")
+            for n in o.warnings:
+                print(f"  {o.slide.name}: WARNING {n}")
 
     counts: dict[str, int] = {}
     for o in outcomes:
         counts[o.status] = counts.get(o.status, 0) + 1
+    review = sum(1 for o in outcomes if needs_review(o))
     print("\n" + ", ".join(f"{v} {k}" for k, v in counts.items())
-          + f" — {len(outcomes)} slide(s) in {elapsed:.0f}s")
+          + f" — {len(outcomes)} slide(s) in {elapsed:.0f}s"
+          + (f"; {review} need review (see the needs_review column)" if review else ""))
 
     if not target.exists():
         return None
     report = target / f"dicom2svs_summary_{datetime.now():%Y%m%d_%H%M%S}.csv"
     with open(report, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["slide", "status", "source_file", "output_file", "width", "height",
-                    "objective", "mpp", "dicom_bytes", "svs_bytes", "seconds", "notes"])
+        w.writerow(["slide", "status", "needs_review", "warning_count", "warnings", "errors",
+                    "source_folder", "source_file", "dicom_files_in_folder", "output_file",
+                    "width", "height", "objective_recorded", "svs_magnification",
+                    "magnification_source", "mpp", "dicom_bytes", "svs_bytes", "seconds"])
         for o in outcomes:
             i = o.info
-            w.writerow([o.slide.name, o.status, o.slide.largest.path,
-                        o.output if o.output and o.output.exists() else "",
-                        i.width if i else "", i.height if i else "",
-                        i.objective if i and i.objective else "", f"{i.mpp:.6f}" if i else "",
-                        o.slide.largest.size,
-                        o.output.stat().st_size if o.output and o.output.exists() else "",
-                        f"{o.seconds:.1f}", " | ".join(o.notes)])
+            out_ok = o.output and o.output.exists()
+            w.writerow([
+                o.slide.name, o.status, "yes" if needs_review(o) else "no", len(o.warnings),
+                " | ".join(o.warnings), " | ".join(o.notes),
+                o.slide.folder, o.slide.largest.path, len(o.slide.files),
+                o.output if out_ok else "",
+                i.width or "" if i else "", i.height or "" if i else "",
+                f"{i.objective:g}" if i and i.objective is not None else "",
+                f"{i.app_mag:g}" if i and i.app_mag else "", i.mag_source if i else "",
+                f"{i.mpp:.6f}" if i and i.mpp else "",
+                o.slide.largest.size, o.output.stat().st_size if out_ok else "",
+                f"{o.seconds:.1f}"])
     print(f"Summary saved to {report}")
     return report
 
@@ -637,12 +708,15 @@ def print_summary(outcomes: list[Outcome], target: Path, elapsed: float) -> Path
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Convert the full-resolution 40x DICOM whole-slide image in each "
-                    "slide folder to a pyramidal Aperio .svs file.")
+        description="Convert the largest DICOM whole-slide image in each folder to a "
+                    "pyramidal Aperio .svs file. Missing or unexpected metadata (e.g. no "
+                    "objective power) is recorded as a warning in the summary, not skipped.")
     ap.add_argument("dirs", nargs="+", type=Path, help="directories to scan (recursively)")
     ap.add_argument("-o", "--output", type=Path, required=True, help="target directory for .svs files")
     ap.add_argument("--dry-run", action="store_true", help="scan and check only, do not convert")
     ap.add_argument("--overwrite", action="store_true", help="replace existing .svs files")
+    ap.add_argument("--strict", action="store_true",
+                    help="skip slides with metadata warnings instead of converting them")
     ap.add_argument("--quality", type=int, default=90,
                     help="JPEG quality for the generated lower-resolution levels (default 90); "
                          "full-resolution tiles are always copied unchanged")
@@ -657,7 +731,8 @@ def main() -> int:
 
     start = time.time()
     slides = scan([d.expanduser().resolve() for d in args.dirs])
-    print(f"Found {len(slides)} slide(s) in {sum(len(s.files) for s in slides)} DICOM file(s)")
+    print(f"Found {len(slides)} folder(s) with {sum(len(s.files) for s in slides)} DICOM "
+          f"file(s); converting the largest file of each folder")
     if not args.dry_run:
         target.mkdir(parents=True, exist_ok=True)
 
@@ -669,12 +744,16 @@ def main() -> int:
         checks, info = check_source(slide)
         print_checks("Pre-conversion checks:", checks)
         out_path = target / f"{slide.name}.svs"
-        o = Outcome(slide, "", info, out_path)
+        o = Outcome(slide, "", info, out_path, warnings=list(checks.warnings))
         outcomes.append(o)
 
         if not checks.ok:
             o.status, o.output = "skipped", None
             o.notes += [f"check failed - {x}" for x in checks.failed]
+            continue
+        if args.strict and checks.warnings:
+            o.status, o.output = "skipped", None
+            o.notes.append("skipped by --strict because of metadata warnings")
             continue
         if out_path.exists() and not args.overwrite:
             o.status = "exists"

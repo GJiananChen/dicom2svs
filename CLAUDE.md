@@ -6,8 +6,9 @@ files. Dependencies are declared inline (PEP 723), so always run it with
 
 - To convert slides for the user, follow `.claude/skills/dicom2svs/SKILL.md`: dry run first,
   convert after confirmation, then report the summary.
-- Code layout, top to bottom: scanning and grouping (`scan`) → 40x pre-checks
-  (`check_source`) → tile passthrough and pyramid building (`TileSource`, `build_level`,
+- Code layout, top to bottom: scanning, one slide per folder (`scan`) → pre-checks
+  (`check_source`; metadata problems are `fatal=False` warnings, only unconvertible
+  files fail) → tile passthrough and pyramid building (`TileSource`, `build_level`,
   `convert`) → OpenSlide verification (`verify`) → summary table and CSV (`print_summary`).
 - The 40x level must stay a byte-for-byte copy of the DICOM JPEG tiles. Only the
   lower levels are re-encoded.
